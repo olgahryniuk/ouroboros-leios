@@ -3,7 +3,7 @@ slots = [100]
 time_scale = [1.0]
 
 # Network topology
-topology = "thousand.toml"
+topology = "medium.toml"
 
 # Transaction parameters
 transaction_frequency_ms = [
