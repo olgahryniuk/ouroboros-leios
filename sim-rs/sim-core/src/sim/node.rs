@@ -55,6 +55,20 @@ enum CpuTask {
 }
 
 impl CpuTask {
+    fn task_type(&self) -> String {
+        match self {
+            Self::TransactionValidated(_, _) => "TransactionValidated",
+            Self::PraosBlockGenerated(_) => "PraosBlockGenerated",
+            Self::PraosBlockValidated(_, _) => "PraosBlockValidated",
+            Self::InputBlockGenerated(_) => "InputBlockGenerated",
+            Self::InputBlockValidated(_, _) => "InputBlockValidated",
+            Self::EndorserBlockGenerated(_) => "EndorserBlockGenerated",
+            Self::EndorserBlockValidated(_, _) => "EndorserBlockValidated",
+            Self::VoteBundleGenerated(_) => "VoteBundleGenerated",
+            Self::VoteBundleValidated(_, _) => "VoteBundleValidated",
+        }
+        .to_string()
+    }
     fn cpu_times(&self, config: &SimConfiguration) -> Vec<Duration> {
         match self {
             Self::TransactionValidated(_, _) => vec![config.tx_validation_cpu_time],
@@ -215,12 +229,23 @@ impl Node {
 
     fn schedule_cpu_task(&mut self, task: CpuTask) {
         let cpu_times = task.cpu_times(&self.sim_config);
-        for subtask in self.cpu.schedule_task(task, cpu_times) {
-            self.schedule_cpu_subtask(subtask);
+        let task_type = task.task_type();
+        let subtask_count = cpu_times.len();
+        let (task_id, subtasks) = self.cpu.schedule_task(task, cpu_times);
+        self.tracker.track_cpu_task_scheduled(
+            format!("{}-{}", self.id, task_id),
+            task_type,
+            subtask_count,
+        );
+        for subtask in subtasks {
+            self.start_cpu_subtask(subtask);
         }
     }
 
-    fn schedule_cpu_subtask(&mut self, subtask: Subtask) {
+    fn start_cpu_subtask(&mut self, subtask: Subtask) {
+        let task_id = format!("{}-{}", self.id, subtask.task_id);
+        self.tracker
+            .track_cpu_subtask_started(task_id, subtask.subtask_id);
         let timestamp = self.clock.now() + subtask.duration;
         self.events.push(FutureEvent(
             timestamp,
@@ -256,13 +281,16 @@ impl Node {
                         NodeEvent::NewSlot(slot) => self.handle_new_slot(slot)?,
                         NodeEvent::MessageReceived(from, msg) => self.handle_message(from, msg)?,
                         NodeEvent::CpuSubtaskCompleted(subtask) => {
+                            let task_id = format!("{}-{}", self.id, subtask.task_id);
+                            self.tracker.track_cpu_subtask_finished(task_id.clone(), subtask.subtask_id);
                             let (finished_task, next_subtask) = self.cpu.complete_subtask(subtask);
                             if let Some(subtask) = next_subtask {
-                                self.schedule_cpu_subtask(subtask);
+                                self.start_cpu_subtask(subtask);
                             }
                             let Some(task) = finished_task else {
                                 continue;
                             };
+                            self.tracker.track_cpu_task_finished(task_id);
                             match task {
                                 CpuTask::TransactionValidated(from, tx) => self.propagate_tx(from, tx)?,
                                 CpuTask::PraosBlockGenerated(block) => self.finish_generating_block(block)?,
@@ -469,12 +497,16 @@ impl Node {
             // For every VRF lottery you won, you can vote for every EB
             vrf_wins * ebs.len()
         };
+        let mut eb_counts = BTreeMap::new();
+        for eb in ebs.iter().cycle().take(votes_allowed) {
+            *eb_counts.entry(*eb).or_default() += 1;
+        }
         let votes = VoteBundle {
             id: VoteBundleId {
                 slot,
                 producer: self.id,
             },
-            ebs: ebs.iter().cloned().cycle().take(votes_allowed).collect(),
+            ebs: eb_counts,
         };
         if !votes.ebs.is_empty() {
             self.tracker.track_vote_lottery_won(&votes);
@@ -878,12 +910,12 @@ impl Node {
         {
             return Ok(());
         }
-        for eb in votes.ebs.iter() {
+        for (eb, count) in votes.ebs.iter() {
             self.leios
                 .votes_by_eb
                 .entry(*eb)
                 .or_default()
-                .push(votes.id.producer);
+                .extend(std::iter::repeat(votes.id.producer).take(*count));
         }
         // We haven't seen these votes before, so propagate them to our neighbors
         for peer in &self.peers {
@@ -1011,12 +1043,12 @@ impl Node {
 
     fn finish_generating_vote_bundle(&mut self, votes: VoteBundle) -> Result<()> {
         self.tracker.track_votes_generated(&votes);
-        for eb in &votes.ebs {
+        for (eb, count) in &votes.ebs {
             self.leios
                 .votes_by_eb
                 .entry(*eb)
                 .or_default()
-                .push(votes.id.producer);
+                .extend(std::iter::repeat(votes.id.producer).take(*count));
         }
         let votes = Arc::new(votes);
         self.leios

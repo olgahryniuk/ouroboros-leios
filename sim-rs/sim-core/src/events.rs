@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -16,6 +18,22 @@ use crate::{
 pub enum Event {
     Slot {
         number: u64,
+    },
+    CpuTaskScheduled {
+        task_id: String,
+        task_type: String,
+        subtasks: usize,
+    },
+    CpuTaskFinished {
+        task_id: String,
+    },
+    CpuSubtaskStarted {
+        task_id: String,
+        subtask_id: u64,
+    },
+    CpuSubtaskFinished {
+        task_id: String,
+        subtask_id: u64,
     },
     TransactionGenerated {
         id: TransactionId,
@@ -96,11 +114,13 @@ pub enum Event {
         recipient: NodeId,
     },
     VoteLotteryWon {
+        #[serde(flatten)]
         id: VoteBundleId,
     },
     VotesGenerated {
+        #[serde(flatten)]
         id: VoteBundleId,
-        ebs: Vec<EndorserBlockId>,
+        votes: Votes,
     },
     NoVote {
         slot: u64,
@@ -109,15 +129,29 @@ pub enum Event {
         reason: NoVoteReason,
     },
     VotesSent {
+        #[serde(flatten)]
         id: VoteBundleId,
         sender: NodeId,
         recipient: NodeId,
     },
     VotesReceived {
+        #[serde(flatten)]
         id: VoteBundleId,
         sender: NodeId,
         recipient: NodeId,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct Votes(pub BTreeMap<EndorserBlockId, usize>);
+
+impl Serialize for Votes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_map(self.0.iter().map(|(k, v)| (k.to_string(), *v)))
+    }
 }
 
 #[derive(Clone)]
@@ -133,6 +167,32 @@ impl EventTracker {
 
     pub fn track_slot(&self, number: u64) {
         self.send(Event::Slot { number });
+    }
+
+    pub fn track_cpu_task_scheduled(&self, task_id: String, task_type: String, subtasks: usize) {
+        self.send(Event::CpuTaskScheduled {
+            task_id,
+            task_type,
+            subtasks,
+        });
+    }
+
+    pub fn track_cpu_task_finished(&self, task_id: String) {
+        self.send(Event::CpuTaskFinished { task_id });
+    }
+
+    pub fn track_cpu_subtask_started(&self, task_id: String, subtask_id: u64) {
+        self.send(Event::CpuSubtaskStarted {
+            task_id,
+            subtask_id,
+        });
+    }
+
+    pub fn track_cpu_subtask_finished(&self, task_id: String, subtask_id: u64) {
+        self.send(Event::CpuSubtaskFinished {
+            task_id,
+            subtask_id,
+        });
     }
 
     pub fn track_praos_block_lottery_won(&self, block: &Block) {
@@ -253,7 +313,7 @@ impl EventTracker {
     pub fn track_votes_generated(&self, votes: &VoteBundle) {
         self.send(Event::VotesGenerated {
             id: votes.id,
-            ebs: votes.ebs.clone(),
+            votes: Votes(votes.ebs.clone()),
         });
     }
 
